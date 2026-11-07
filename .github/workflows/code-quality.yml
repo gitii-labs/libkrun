@@ -59,6 +59,10 @@ jobs:
       - name: Vsock queue and stream regressions
         timeout-minutes: 5
         run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
+
+      - name: Virtio-fs worker shutdown regressions
+        timeout-minutes: 5
+        run: cargo test --locked -p msb_krun_devices --lib 'virtio::fs::worker::tests'
       
       - name: Clippy (efi+gpu)
         run: cargo clippy --locked --features efi,gpu -- -D warnings
