@@ -16,7 +16,7 @@ concurrency:
 jobs:
   linux-x86:
     name: Running nested VM (Linux x86_64)
-    runs-on: [self-hosted, Linux, X64, self-hosted-ubuntu-2404-x64, nested-virt]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
@@ -27,6 +27,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+      - name: Install nested build dependencies
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Enable KVM access on the hosted VM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -a -G kvm "$USER"
       - uses: actions/checkout@v4
         with:
           repository: superradcompany/libkrunfw
@@ -35,28 +48,27 @@ jobs:
           persist-credentials: false
       - name: Check nested virtualization host
         run: |
+          uname -a
           lscpu
           test -c /dev/kvm
+          ls -l /dev/kvm
           grep -Eq '(vmx|svm)' /proc/cpuinfo
+          nested_module_found=false
           for module in kvm_intel kvm_amd; do
             if test -f /sys/module/$module/parameters/nested; then
+              nested_module_found=true
+              echo "$module nested=$(cat /sys/module/$module/parameters/nested)"
               grep -Eq '^(Y|1)$' /sys/module/$module/parameters/nested
             fi
           done
-          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
-            echo "::error::The self-hosted runner account needs read/write access to /dev/kvm."
+          if test "$nested_module_found" != true; then
+            echo "::error::No KVM module exposes its nested virtualization setting."
             exit 1
           fi
-      - name: Check provisioned build dependencies
-        run: |
-          for package in build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools; do
-            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
-              echo "::error::Install $package during runner provisioning. CI jobs do not have sudo access."
-              exit 1
-            fi
-          done
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo "::error::The hosted runner account needs read/write access to /dev/kvm."
+            exit 1
+          fi
       - uses: actions/cache@v4
         with:
           path: |
