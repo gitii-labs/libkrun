@@ -112,7 +112,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             &EpollEvent::new(EventSet::IN, STOP_EVENT),
         );
 
-        loop {
+        'work: loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
@@ -131,10 +131,14 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                         let event_set = event.event_set();
                         match source {
                             HPQ_EVENT if event_set.contains(EventSet::IN) => {
-                                self.handle_event(HPQ_INDEX);
+                                if self.handle_event(HPQ_INDEX) {
+                                    break 'work;
+                                }
                             }
                             REQ_EVENT if event_set.contains(EventSet::IN) => {
-                                self.handle_event(REQ_INDEX);
+                                if self.handle_event(REQ_INDEX) {
+                                    break 'work;
+                                }
                             }
                             STOP_EVENT if event_set.contains(EventSet::IN) => {
                                 unreachable!("stop events are handled before queue events");
@@ -160,7 +164,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         }
     }
 
-    fn handle_event(&mut self, queue_index: usize) {
+    fn handle_event(&mut self, queue_index: usize) -> bool {
         debug!("Fs: queue event: {queue_index}");
         if let Err(e) = self.queue_evts[queue_index].read() {
             error!("Failed to get queue event: {e:?}");
@@ -175,7 +179,9 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 // Re-enable guest notification before returning ownership. The queue cursors are
                 // captured by the transport after the worker joins.
                 let _ = self.queues[queue_index].enable_notification(&self.mem);
-                return;
+                // The stop event may already be consumed. Exit the worker instead of
+                // waiting for another event that reset/quiesce will never send.
+                return true;
             }
 
             if !self.queues[queue_index]
@@ -185,6 +191,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 break;
             }
         }
+        false
     }
 
     fn process_queue(&mut self, queue_index: usize) -> bool {
@@ -240,4 +247,247 @@ fn eventfd_pollable(event: &EventFd) -> Pollable {
 #[cfg(windows)]
 fn eventfd_pollable(event: &EventFd) -> Pollable {
     event.as_raw_handle()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use utils::eventfd::EFD_NONBLOCK;
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use vm_memory::{Bytes, GuestAddress};
+
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::fs::fuse::{InHeader, Opcode, OutHeader};
+    use crate::virtio::queue::tests::VirtQueue;
+
+    const WAIT: Duration = Duration::from_secs(5);
+    const SESSION_OPTIONS: u64 = 0x1234;
+
+    // Hold a real FUSE request inside the server, after the worker's epoll dispatch.
+    struct BlockingFs {
+        started: Sender<u64>,
+        proceed: Mutex<Receiver<()>>,
+    }
+
+    impl FileSystem for BlockingFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn request_error(&self, inode: u64) -> Option<i32> {
+            self.started.send(inode).unwrap();
+            self.proceed.lock().unwrap().recv_timeout(WAIT).unwrap();
+            Some(5) // Linux EIO: the request still receives a complete FUSE reply.
+        }
+    }
+
+    struct Fixture<'a> {
+        rings: Vec<VirtQueue<'a>>,
+        worker: FsWorker<BlockingFs>,
+        started: Receiver<u64>,
+        proceed: Sender<()>,
+    }
+
+    fn fixture(mem: &GuestMemoryMmap, queue_index: usize, event_idx: bool) -> Fixture<'_> {
+        let (started_tx, started) = channel();
+        let (proceed, proceed_rx) = channel();
+        let rings = vec![
+            VirtQueue::new(GuestAddress(0), mem, 8),
+            VirtQueue::new(GuestAddress(0x1000), mem, 8),
+        ];
+        let mut queues = rings
+            .iter()
+            .map(VirtQueue::create_queue)
+            .collect::<Vec<_>>();
+        queues[queue_index].set_event_idx(event_idx);
+        for request in 0..2u16 {
+            let address = 0x2000 + u64::from(request) * 0x1000;
+            let header = InHeader {
+                len: size_of::<InHeader>() as u32,
+                opcode: Opcode::Getattr as u32,
+                unique: u64::from(request) + 1,
+                nodeid: u64::from(request) + 1,
+                ..Default::default()
+            };
+            mem.write_obj(header, GuestAddress(address)).unwrap();
+            let ring = &rings[queue_index];
+            ring.dtable[usize::from(request) * 2].set(
+                address,
+                header.len,
+                VRING_DESC_F_NEXT as u16,
+                request * 2 + 1,
+            );
+            ring.dtable[usize::from(request) * 2 + 1].set(
+                address + 0x100,
+                128,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            );
+            ring.avail.ring[usize::from(request)].set(request * 2);
+        }
+        rings[queue_index].avail.idx.set(2);
+        Fixture {
+            rings,
+            worker: FsWorker::new(
+                Arc::new(BlockingFs {
+                    started: started_tx,
+                    proceed: Mutex::new(proceed_rx),
+                }),
+                queues,
+                (0..2)
+                    .map(|_| Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
+                    .collect(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "fs-worker-test".into())
+                    .unwrap(),
+                mem.clone(),
+                None,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                Arc::new(AtomicI32::new(0)),
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                None,
+                SESSION_OPTIONS,
+            ),
+            started,
+            proceed,
+        }
+    }
+
+    #[test]
+    fn stop_consumed_during_request_exits_worker_and_preserves_queued_request() {
+        for queue_index in [HPQ_INDEX, REQ_INDEX] {
+            for event_idx in [false, true] {
+                let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+                let fixture = fixture(&mem, queue_index, event_idx);
+                let stop = fixture.worker.stop_fd.try_clone().unwrap();
+                fixture.worker.queue_evts[queue_index].write(1).unwrap();
+                let (done_tx, done_rx) = channel();
+                let worker = thread::spawn(move || done_tx.send(fixture.worker.work()).unwrap());
+
+                // No stop is pending at epoll dispatch. Only process_queue can consume it
+                // after this in-flight request completes; the second request stays queued.
+                assert_eq!(fixture.started.recv_timeout(WAIT).unwrap(), 1);
+                stop.write(1).unwrap();
+                fixture.proceed.send(()).unwrap();
+                let state = done_rx
+                    .recv_timeout(WAIT)
+                    .expect("worker lost the consumed stop");
+                worker.join().unwrap();
+                assert_eq!(state.session_options, SESSION_OPTIONS);
+                assert_eq!(state.queue_evts.len(), 2);
+                let queue = &state.queues[queue_index];
+                let captured = queue.capture_state().unwrap();
+                assert_eq!(captured.next_avail, 1);
+                assert_eq!(captured.next_used, 1);
+                assert_eq!(queue.len(&mem), 1);
+                assert_eq!(captured.event_idx_enabled, event_idx);
+                if event_idx {
+                    assert_eq!(fixture.rings[queue_index].used.event.get(), 1);
+                } else {
+                    assert_eq!(fixture.rings[queue_index].used.flags.get(), 0);
+                }
+                let reply: OutHeader = mem.read_obj(GuestAddress(0x2100)).unwrap();
+                assert_eq!(reply.unique, 1);
+                assert_eq!(reply.error, -5);
+                assert!(matches!(
+                    fixture.started.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_queue_event_completes_requests_and_reenables_notifications() {
+        for queue_index in [HPQ_INDEX, REQ_INDEX] {
+            for event_idx in [false, true] {
+                let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+                let mut fixture = fixture(&mem, queue_index, event_idx);
+                fixture.worker.queue_evts[queue_index].write(1).unwrap();
+                let worker = thread::spawn(move || {
+                    assert!(!fixture.worker.handle_event(queue_index));
+                    fixture.worker
+                });
+                for inode in [1, 2] {
+                    assert_eq!(fixture.started.recv_timeout(WAIT).unwrap(), inode);
+                    fixture.proceed.send(()).unwrap();
+                }
+                let worker = worker.join().unwrap();
+                let queue = &worker.queues[queue_index];
+                let captured = queue.capture_state().unwrap();
+                assert_eq!(captured.next_avail, 2);
+                assert_eq!(captured.next_used, 2);
+                assert_eq!(queue.len(&mem), 0);
+                assert_eq!(worker.server.session_options(), SESSION_OPTIONS);
+                if event_idx {
+                    assert_eq!(fixture.rings[queue_index].used.event.get(), 2);
+                } else {
+                    assert_eq!(fixture.rings[queue_index].used.flags.get(), 0);
+                }
+                for request in 0..2u64 {
+                    let reply: OutHeader = mem
+                        .read_obj(GuestAddress(0x2100 + request * 0x1000))
+                        .unwrap();
+                    assert_eq!(reply.unique, request + 1);
+                    assert_eq!(reply.error, -5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_stop_wins_over_queued_requests() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let fixture = fixture(&mem, REQ_INDEX, false);
+        fixture.worker.queue_evts[REQ_INDEX].write(1).unwrap();
+        fixture.worker.stop_fd.write(1).unwrap();
+        let state = fixture.worker.work();
+        assert_eq!(state.session_options, SESSION_OPTIONS);
+        let captured = state.queues[REQ_INDEX].capture_state().unwrap();
+        assert_eq!(captured.next_avail, 0);
+        assert_eq!(captured.next_used, 0);
+        assert_eq!(state.queues[REQ_INDEX].len(&mem), 2);
+        assert!(matches!(
+            fixture.started.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_read_error_propagates_without_consuming_requests() {
+        use std::fs::OpenOptions;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut fixture = fixture(&mem, REQ_INDEX, false);
+        // A real write-only descriptor produces EBADF rather than WouldBlock.
+        // Transfer ownership so the invalid event handle is closed exactly once.
+        fixture.worker.stop_fd = unsafe {
+            EventFd::from_raw_fd(
+                OpenOptions::new()
+                    .write(true)
+                    .open("/dev/null")
+                    .unwrap()
+                    .into_raw_fd(),
+            )
+        };
+        assert_ne!(
+            fixture.worker.stop_fd.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fixture.worker.queue_evts[REQ_INDEX].write(1).unwrap();
+        assert!(fixture.worker.handle_event(REQ_INDEX));
+        let captured = fixture.worker.queues[REQ_INDEX].capture_state().unwrap();
+        assert_eq!(captured.next_avail, 0);
+        assert_eq!(captured.next_used, 0);
+        assert_eq!(fixture.rings[REQ_INDEX].used.flags.get(), 0);
+        assert!(matches!(
+            fixture.started.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
 }

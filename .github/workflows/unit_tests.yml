@@ -28,6 +28,10 @@ jobs:
         timeout-minutes: 5
         run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
 
+      - name: Virtio-fs worker shutdown regressions
+        timeout-minutes: 5
+        run: cargo test --locked -p msb_krun_devices --lib 'virtio::fs::worker::tests'
+
       - name: Virtio-net rate-limit tests
         run: cargo test --locked -p msb_krun_devices --features net virtio::net
 
@@ -67,6 +71,10 @@ jobs:
       - name: Vsock queue and stream regressions
         timeout-minutes: 5
         run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
+
+      - name: Virtio-fs worker shutdown regressions
+        timeout-minutes: 5
+        run: cargo test --locked -p msb_krun_devices --lib 'virtio::fs::worker::tests'
 
       - name: Windows DAX default error test
         run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::fs::dyn_filesystem::tests
